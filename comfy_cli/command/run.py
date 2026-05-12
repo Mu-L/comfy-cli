@@ -19,20 +19,73 @@ from comfy_cli.workspace_manager import WorkspaceManager
 workspace_manager = WorkspaceManager()
 
 
-def load_api_workflow(file: str):
-    with open(file, encoding="utf-8") as f:
-        workflow = json.load(f)
-        # Check for litegraph properties to ensure this isnt a UI workflow file
-        if "nodes" in workflow and "links" in workflow:
-            return None
+def is_ui_workflow(workflow) -> bool:
+    return (
+        isinstance(workflow, dict)
+        and isinstance(workflow.get("nodes"), list)
+        and isinstance(workflow.get("links"), list)
+    )
 
-        # Try validating the first entry to ensure it has a node class property
-        node_id = next(iter(workflow))
-        node = workflow[node_id]
-        if "class_type" not in node:
-            return None
 
-        return workflow
+def _validate_api_workflow(workflow):
+    """Return the workflow dict if it has the shape of API format, else None."""
+    if not isinstance(workflow, dict) or not workflow:
+        return None
+    node = workflow[next(iter(workflow))]
+    if not isinstance(node, dict) or "class_type" not in node:
+        return None
+    return workflow
+
+
+class WorkflowConverterUnavailable(Exception):
+    """The running ComfyUI server doesn't expose /workflow/convert."""
+
+
+def convert_ui_workflow_via_server(workflow: dict, host: str, port: int, timeout: int) -> dict:
+    """POST a UI-format workflow to the server's /workflow/convert and return API-format JSON.
+
+    Raises WorkflowConverterUnavailable if the server doesn't expose the endpoint.
+    Raises typer.Exit on other conversion failures.
+    """
+    url = f"http://{host}:{port}/workflow/convert"
+    req = request.Request(url, json.dumps(workflow).encode("utf-8"))
+    req.add_header("Content-Type", "application/json")
+    try:
+        resp = request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            raise WorkflowConverterUnavailable() from e
+        body = e.read().decode("utf-8", errors="replace").strip()
+        pprint(f"[bold red]Workflow conversion failed (HTTP {e.code}): {body[:500]}[/bold red]")
+        raise typer.Exit(code=1) from e
+    except urllib.error.URLError as e:
+        pprint(f"[bold red]Workflow conversion failed: {e.reason}[/bold red]")
+        raise typer.Exit(code=1) from e
+    try:
+        converted = json.loads(resp.read())
+    except json.JSONDecodeError as e:
+        pprint("[bold red]Workflow conversion failed: server returned invalid JSON[/bold red]")
+        raise typer.Exit(code=1) from e
+    if not isinstance(converted, dict) or not converted:
+        pprint("[bold red]Workflow conversion failed: expected a non-empty JSON object[/bold red]")
+        raise typer.Exit(code=1)
+    first = converted[next(iter(converted))]
+    if not isinstance(first, dict) or "class_type" not in first:
+        pprint("[bold red]Workflow conversion failed: returned data is not API workflow format[/bold red]")
+        raise typer.Exit(code=1)
+    return converted
+
+
+def _print_converter_unavailable_help() -> None:
+    pprint(
+        "[bold red]This ComfyUI server doesn't expose a /workflow/convert endpoint[/bold red]\n"
+        "[bold red]to convert it to API format.[/bold red]\n"
+        "\n"
+        "[yellow]Workarounds:[/yellow]\n"
+        "[yellow]  * Install a custom node that adds /workflow/convert on the server[/yellow]\n"
+        "[yellow]  * Or, in the ComfyUI frontend, use 'File > Export (API)' to save[/yellow]\n"
+        "[yellow]    your workflow as API format[/yellow]"
+    )
 
 
 def execute(workflow: str, host, port, wait=True, verbose=False, local_paths=False, timeout=30):
@@ -44,15 +97,32 @@ def execute(workflow: str, host, port, wait=True, verbose=False, local_paths=Fal
         )
         raise typer.Exit(code=1)
 
-    workflow = load_api_workflow(workflow)
-
-    if not workflow:
-        pprint("[bold red]Specified workflow does not appear to be an API workflow json file[/bold red]")
-        raise typer.Exit(code=1)
-
     if not check_comfy_server_running(port, host):
         pprint(f"[bold red]ComfyUI not running on specified address ({host}:{port})[/bold red]")
         raise typer.Exit(code=1)
+
+    try:
+        with open(workflow_name, encoding="utf-8") as f:
+            raw_workflow = json.load(f)
+    except OSError as e:
+        pprint(f"[bold red]Unable to read workflow file: {e}[/bold red]")
+        raise typer.Exit(code=1) from e
+    except json.JSONDecodeError as e:
+        pprint(f"[bold red]Specified workflow file is not valid JSON: {e}[/bold red]")
+        raise typer.Exit(code=1) from e
+
+    if is_ui_workflow(raw_workflow):
+        pprint("[yellow]Detected UI-format workflow, converting via server's /workflow/convert...[/yellow]")
+        try:
+            workflow = convert_ui_workflow_via_server(raw_workflow, host, port, timeout)
+        except WorkflowConverterUnavailable:
+            _print_converter_unavailable_help()
+            raise typer.Exit(code=1)
+    else:
+        workflow = _validate_api_workflow(raw_workflow)
+        if not workflow:
+            pprint("[bold red]Specified workflow does not appear to be an API workflow json file[/bold red]")
+            raise typer.Exit(code=1)
 
     progress = None
     start = time.time()
