@@ -52,7 +52,6 @@ def mock_execution(workflow):
         port=8188,
         verbose=False,
         progress=progress,
-        local_paths=False,
         timeout=30,
     )
 
@@ -165,7 +164,6 @@ class TestWorkflowExecutionAuth:
             port=8188,
             verbose=False,
             progress=progress,
-            local_paths=False,
             timeout=30,
             api_key=api_key,
         )
@@ -262,7 +260,6 @@ class TestWatchExecution:
             port=8188,
             verbose=True,
             progress=progress,
-            local_paths=False,
             timeout=30,
         )
         execution.prompt_id = prompt_id
@@ -310,7 +307,7 @@ class TestWatchExecution:
 
 class TestExecuteErrorHandling:
     def _run_execute_expect_exit(self, workflow_file, **overrides):
-        kwargs = dict(host="127.0.0.1", port=8188, wait=True, verbose=False, local_paths=False, timeout=30)
+        kwargs = dict(host="127.0.0.1", port=8188, wait=True, verbose=False, timeout=30)
         kwargs.update(overrides)
         with pytest.raises(typer.Exit) as exc_info:
             execute(workflow_file, **kwargs)
@@ -507,7 +504,8 @@ class TestExecuteUiWorkflow:
 
             execute(ui_workflow_file, host="127.0.0.1", port=8188, wait=True, timeout=30)
 
-            mock_fetch.assert_called_once_with("127.0.0.1", 8188, 30)
+            mock_fetch.assert_called_once()
+            assert mock_fetch.call_args.args == ("127.0.0.1", 8188, 30)
             api_workflow = MockExec.call_args.args[0]
             assert set(api_workflow) == {"1", "2"}
             assert api_workflow["1"]["class_type"] == "EmptyLatentImage"
@@ -555,7 +553,8 @@ class TestExecuteUiWorkflow:
 
             execute(ui_workflow_file, host="127.0.0.1", port=8188, wait=True, timeout=30, api_key="sk-test")
 
-            mock_fetch.assert_called_once_with("127.0.0.1", 8188, 30)
+            mock_fetch.assert_called_once()
+            assert mock_fetch.call_args.args == ("127.0.0.1", 8188, 30)
             assert MockExec.call_args.kwargs["api_key"] == "sk-test"
 
     def test_ui_workflow_exits_when_conversion_yields_nothing(self):
@@ -585,3 +584,33 @@ class TestExecuteUiWorkflow:
                 MockExec.assert_not_called()
         finally:
             os.unlink(path)
+
+
+class TestWildcardHostSubstitution:
+    """0.0.0.0 is a wildcard bind that macOS/Windows clients can't connect to;
+    execute() substitutes it with the canonical loopback so downstream uses
+    (server probe, /prompt POST, emitted URLs) are portable."""
+
+    def test_zero_zero_zero_zero_substituted_at_entry(self, workflow_file):
+        captured = {}
+
+        def fake_check(port, host, *args, **kwargs):
+            captured["check_host"] = host
+            return False  # short-circuits execute() with a clean exit
+
+        with patch("comfy_cli.command.run.check_comfy_server_running", side_effect=fake_check):
+            with pytest.raises(typer.Exit):
+                execute(workflow_file, host="0.0.0.0", port=8188, json_mode=True)
+        assert captured["check_host"] == "127.0.0.1"
+
+    def test_other_local_hosts_not_substituted(self, workflow_file):
+        captured = {}
+
+        def fake_check(port, host, *args, **kwargs):
+            captured["check_host"] = host
+            return False
+
+        with patch("comfy_cli.command.run.check_comfy_server_running", side_effect=fake_check):
+            with pytest.raises(typer.Exit):
+                execute(workflow_file, host="localhost", port=8188, json_mode=True)
+        assert captured["check_host"] == "localhost"
